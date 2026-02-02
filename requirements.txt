@@ -1,0 +1,10 @@
+python-telegram-bot==20.5
+python-binance
+numpy
+pandas
+ta
+pytz
+textblob
+scikit-learn
+tensorflow
+requests
