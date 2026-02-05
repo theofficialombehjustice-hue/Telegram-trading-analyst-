@@ -3,11 +3,11 @@ from binance.client import Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_TOKEN"
-TWELVEDATA_KEY = "YOUR_TWELVEDATA_KEY"
+TELEGRAM_TOKEN = "8435849845:AAE709exeyXbaQYvtU9_3BfIA0ngp3oZq_w"
+TWELVEDATA_KEY = "064dbdcd38734f70b71db008e502f5e0"
 STATE_FILE = "bot_state.json"
-BINANCE_API_KEY = "YOUR_BINANCE_KEY"
-BINANCE_API_SECRET = "YOUR_BINANCE_SECRET"
+BINANCE_API_KEY = "7orWh37gHVtd1oEEJ8a3RRHMdaEMIVLBe02MmVYAPaRMyOSwhx47ySTAaW5h016N"
+BINANCE_API_SECRET = "zCelW6CBfALhJhdhcInFqF9VC8Hc95JN1MahcnO6Xukr2oDVRHE3VDqyeJNttwn2"
 
 MIN_CANDLES = 150
 SCAN_INTERVAL = 3600
