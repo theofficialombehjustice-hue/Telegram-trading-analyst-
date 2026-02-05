@@ -1,50 +1,78 @@
-import aiohttp, asyncio, pandas as pd, ta, datetime
+import aiohttp, asyncio, pandas as pd, ta, datetime, numpy as np, json, os
+from binance.client import Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-TELEGRAM_TOKEN = "8597020255:AAF20Lvuy1fLBTU7h1CUYOXqOnCyfzLUTFA"
-TWELVEDATA_KEY = "ca1acbf0cedb4488b130c59252891c5e"
-NEWS_API_KEY = "qDGIzb9o2OttTxWNvBLMDyZD9KbdQ0qaPHvupsjH"
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_TOKEN"
+TWELVEDATA_KEY = "YOUR_TWELVEDATA_KEY"
+STATE_FILE = "bot_state.json"
+BINANCE_API_KEY = "YOUR_BINANCE_KEY"
+BINANCE_API_SECRET = "YOUR_BINANCE_SECRET"
 
-MIN_CANDLES = 120
-MIN_ATR_PCT = 0.3
-MIN_BACKTEST_WR = 55
-SCAN_INTERVAL = 180
+MIN_CANDLES = 150
+SCAN_INTERVAL = 3600
 TRACK_INTERVAL = 60
-NEWS_LIMIT = 3
+COOLDOWN_BASE = 3600
+VOLATILITY_THRESHOLD = 0.003
 
 CRYPTOS = {
-    "BTCUSDT":"BTC/USD","ETHUSDT":"ETH/USD","BNBUSDT":"BNB/USD",
-    "XRPUSDT":"XRP/USD","SOLUSDT":"SOL/USD","ADAUSDT":"ADA/USD",
-    "DOGEUSDT":"DOGE/USD","AVAXUSDT":"AVAX/USD","DOTUSDT":"DOT/USD",
-    "MATICUSDT":"MATIC/USD","LTCUSDT":"LTC/USD","LINKUSDT":"LINK/USD",
-    "TRXUSDT":"TRX/USD","ATOMUSDT":"ATOM/USD","UNIUSDT":"UNI/USD"
+    "ETHUSDT":"ETH/USD","BNBUSDT":"BNB/USD","XRPUSDT":"XRP/USD","SOLUSDT":"SOL/USD",
+    "ADAUSDT":"ADA/USD","DOGEUSDT":"DOGE/USD","AVAXUSDT":"AVAX/USD","DOTUSDT":"DOT/USD",
+    "MATICUSDT":"MATIC/USD","LTCUSDT":"LTC/USD","LINKUSDT":"LINK/USD","TRXUSDT":"TRX/USD",
+    "ATOMUSDT":"ATOM/USD","UNIUSDT":"UNI/USD","SHIBUSDT":"SHIB/USD","FTMUSDT":"FTM/USD",
+    "NEARUSDT":"NEAR/USD","AAVEUSDT":"AAVE/USD","EOSUSDT":"EOS/USD","XLMUSDT":"XLM/USD",
+    "SUSHIUSDT":"SUSHI/USD","ALGOUSDT":"ALGO/USD","CHZUSDT":"CHZ/USD","KSMUSDT":"KSM/USD",
+    "ZILUSDT":"ZIL/USD","ENJUSDT":"ENJ/USD","GRTUSDT":"GRT/USD","BATUSDT":"BAT/USD","RVNUSDT":"RVN/USD"
 }
 
 active_trades = {}
-stats = {"wins":0,"losses":0,"be":0}
+cooldowns = {}
+live_trades = {}
+learning_weight = 1.0
+loss_streak = 0
+auto_trade_active = False
+capital = 20.0
+max_loss_percent = 5
+trade_percent = 25
+leverage = 5
 
-def session_ok():
-    h = datetime.datetime.utcnow().hour
-    return 7 <= h <= 20
+binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=False)
 
-async def fetch(session, symbol, interval="15min"):
+if os.path.exists(STATE_FILE):
+    with open(STATE_FILE,"r") as f:
+        d=json.load(f)
+        learning_weight=d.get("learning_weight",learning_weight)
+        loss_streak=d.get("loss_streak",loss_streak)
+        capital=d.get("capital",capital)
+        auto_trade_active=d.get("auto_trade_active",auto_trade_active)
+
+def persist():
+    with open(STATE_FILE,"w") as f:
+        json.dump({
+            "learning_weight":learning_weight,
+            "loss_streak":loss_streak,
+            "capital":capital,
+            "auto_trade_active":auto_trade_active
+        },f)
+
+def evaluate_signal(score):
+    return "Strong Signal 🚀" if score>=3 else "No strong signals"
+
+async def fetch(session, symbol, interval="15min", outputsize=1000):
     try:
-        async with session.get(
-            "https://api.twelvedata.com/time_series",
-            params={"symbol":CRYPTOS[symbol],"interval":interval,"outputsize":500,"apikey":TWELVEDATA_KEY},
-            timeout=10
-        ) as r:
+        async with session.get("https://api.twelvedata.com/time_series",
+            params={"symbol":CRYPTOS[symbol],"interval":interval,"outputsize":outputsize,"apikey":TWELVEDATA_KEY},
+            timeout=10) as r:
             j = await r.json()
-            if "values" not in j:
-                return pd.DataFrame()
-            rows=[{"c":float(v["close"]),"h":float(v["high"]),"l":float(v["low"])} for v in reversed(j["values"])]
-            return pd.DataFrame(rows)
+            if "values" in j:
+                rows=[{"c":float(v["close"]),"h":float(v["high"]),"l":float(v["low"]),"v":float(v.get("volume",0))} for v in reversed(j["values"])]
+                return pd.DataFrame(rows)
     except:
-        return pd.DataFrame()
+        pass
+    return pd.DataFrame()
 
 def enrich(df):
-    if len(df) < MIN_CANDLES:
+    if len(df)<MIN_CANDLES:
         return pd.DataFrame()
     df["RSI"]=ta.momentum.RSIIndicator(df["c"],14).rsi()
     df["EMA50"]=ta.trend.EMAIndicator(df["c"],50).ema_indicator()
@@ -52,129 +80,101 @@ def enrich(df):
     df["MACD"]=ta.trend.MACD(df["c"]).macd_diff()
     df["ADX"]=ta.trend.ADXIndicator(df["h"],df["l"],df["c"]).adx()
     df["ATR"]=ta.volatility.AverageTrueRange(df["h"],df["l"],df["c"]).average_true_range()
+    df["BOLL_H"]=ta.volatility.BollingerBands(df["c"]).bollinger_hband()
+    df["BOLL_L"]=ta.volatility.BollingerBands(df["c"]).bollinger_lband()
+    df["VWAP"]=ta.volume.VolumeWeightedAveragePrice(df["h"],df["l"],df["c"],df["v"]).volume_weighted_average_price()
+    df["SuperTrend"]=ta.trend.STCIndicator(df["c"]).stc()
+    df["StochRSI"]=ta.momentum.StochRSIIndicator(df["c"]).stochrsi()
+    df["OBV"]=ta.volume.OnBalanceVolumeIndicator(df["c"],df["v"]).on_balance_volume()
+    df["VOLUSD"]=df["v"]*df["c"]
     return df.dropna()
 
-def backtest_score(df):
-    wins=0; losses=0
-    for i in range(50,len(df)-5):
-        r=df.iloc[i]
-        s=0
-        s+=2 if r["EMA50"]>r["EMA200"] else -2
-        s+=1 if r["RSI"]>55 else -1 if r["RSI"]<45 else 0
-        s+=1 if r["MACD"]>0 else -1
-        s+=1 if r["ADX"]>20 else 0
-        if s>=3:
-            if df["c"].iloc[i+3]>r["c"]: wins+=1
-            else: losses+=1
-        if s<=-3:
-            if df["c"].iloc[i+3]<r["c"]: wins+=1
-            else: losses+=1
-    t=wins+losses
-    return (wins/t)*100 if t else 0
-
-async def fetch_news(session, symbol, limit=NEWS_LIMIT):
-    try:
-        query = symbol.replace("USDT","") + " crypto"
-        async with session.get(
-            "https://newsapi.org/v2/everything",
-            params={"q":query,"pageSize":limit,"sortBy":"publishedAt","apiKey":NEWS_API_KEY},
-            timeout=10
-        ) as r:
-            j = await r.json()
-            if "articles" not in j: return []
-            return [{"title":a["title"],"url":a["url"]} for a in j["articles"]]
-    except:
-        return []
-
-def signal(df):
+def signal(df, weight=1):
     last=df.iloc[-1]
-    atr_pct=(last["ATR"]/last["c"])*100
-    if atr_pct < MIN_ATR_PCT:
-        return None
-    if backtest_score(df) < MIN_BACKTEST_WR:
+    if last["ATR"]/last["c"]<VOLATILITY_THRESHOLD:
         return None
     s=0
-    s+=2 if last["EMA50"]>last["EMA200"] else -2
-    s+=1 if last["RSI"]>55 else -1 if last["RSI"]<45 else 0
-    s+=1 if last["MACD"]>0 else -1
-    s+=1 if last["ADX"]>20 else 0
-    if s>=3: d="BUY"
-    elif s<=-3: d="SELL"
-    else: return None
-    p=last["c"]; atr=last["ATR"]
-    return {"dir":d,"entry":p,"sl":p-atr*1.5 if d=="BUY" else p+atr*1.5,"tp":p+atr*3 if d=="BUY" else p-atr*3,"atr":atr,"score":s,"be":False}
-
-async def btc_trend(session):
-    df=enrich(await fetch(session,"BTCUSDT"))
-    if df.empty: return None
-    r=df.iloc[-1]
-    return "BUY" if r["EMA50"]>r["EMA200"] else "SELL"
-
-async def multi_tf_signal(session, symbol):
-    if not session_ok(): return None
-    btc_dir = await btc_trend(session)
-    df15 = enrich(await fetch(session,symbol,"15min"))
-    df5 = enrich(await fetch(session,symbol,"5min"))
-    if df15.empty or df5.empty: return None
-    sig15 = signal(df15)
-    sig5 = signal(df5)
-    if not sig15 or not sig5: return None
-    if sig15["dir"]!=sig5["dir"]: return None
-    if symbol!="BTCUSDT" and sig15["dir"]!=btc_dir: return None
-    return sig15
+    s+=2.5 if last["EMA50"]>last["EMA200"] else -2.5
+    s+=1.2 if last["RSI"]>55 else -1.2 if last["RSI"]<45 else 0
+    s+=1.5 if last["MACD"]>0 else -1.5
+    s+=1.2 if last["ADX"]>20 else 0
+    s+=1.0 if last["SuperTrend"]>last["c"] else -1.0
+    s+=0.8 if last["StochRSI"]>0.8 else -0.8 if last["StochRSI"]<0.2 else 0
+    s*=weight
+    if s<3:
+        return None
+    p=last["c"]
+    atr=last["ATR"]
+    return {"dir":"BUY","entry":p,"sl":p-atr,"tp":p+atr*2,"score":s}
 
 async def scan(context):
-    signals=[]
+    if not auto_trade_active:
+        return
+    now=datetime.datetime.utcnow().timestamp()
     async with aiohttp.ClientSession() as s:
+        signals=[]
         for sym in CRYPTOS:
-            if sym in active_trades: continue
-            sig = await multi_tf_signal(s,sym)
-            if sig: signals.append((sym,sig))
-    signals.sort(key=lambda x: abs(x[1]["score"]),reverse=True)
-    top3=signals[:3]
-    if top3:
-        msg="🚀 TOP CRYPTO SIGNALS\n\n"
-        async with aiohttp.ClientSession() as s:
-            for i,(sym,s) in enumerate(top3,1):
-                news = await fetch_news(s,sym)
-                msg+=f"{i}. {sym}\nDir: {s['dir']}\nEntry: {round(s['entry'],5)}\nSL: {round(s['sl'],5)}\nTP: {round(s['tp'],5)}\nScore: {s['score']}\n"
-                if news:
-                    msg+="📰 News:\n"
-                    for n in news:
-                        msg+=f"{n['title']}\n{n['url']}\n"
-                msg+="\n"
-        await context.bot.send_message(chat_id=context.job.chat_id,text=msg)
-        for sym,s in top3: active_trades[sym]=s
+            if sym in active_trades:
+                continue
+            if sym in cooldowns and cooldowns[sym]>now:
+                continue
+            df=enrich(await fetch(s,sym,"1h"))
+            if df.empty:
+                continue
+            sig=signal(df,learning_weight)
+            if sig:
+                signals.append((sym,sig))
+        signals=sorted(signals,key=lambda x:abs(x[1]["score"]),reverse=True)[:3]
+        for sym,sig in signals:
+            active_trades[sym]=sig
+            live_trades[sym]=sig
+        if signals:
+            msg="🚀 TOP SIGNALS\n\n"
+            for sym,sig in signals:
+                msg+=f"{sym}\n{sig['dir']} | Score {sig['score']} | {evaluate_signal(sig['score'])}\n\n"
+            await context.bot.send_message(chat_id=context.job.chat_id,text=msg)
 
 async def track(context):
+    global learning_weight, loss_streak, capital, auto_trade_active
+    if not auto_trade_active:
+        return
+    now=datetime.datetime.utcnow().timestamp()
+    remove=[]
     async with aiohttp.ClientSession() as s:
-        for sym in list(active_trades):
-            df=await fetch(s,sym)
-            if df.empty: continue
-            price=df["c"].iloc[-1]
-            t=active_trades[sym]
-            if not t["be"]:
-                if t["dir"]=="BUY" and price>=t["entry"]+t["atr"]:
-                    t["sl"]=t["entry"]; t["be"]=True
-                if t["dir"]=="SELL" and price<=t["entry"]-t["atr"]:
-                    t["sl"]=t["entry"]; t["be"]=True
-            tp = price>=t["tp"] if t["dir"]=="BUY" else price<=t["tp"]
-            sl = price<=t["sl"] if t["dir"]=="BUY" else price>=t["sl"]
-            if tp or sl:
-                if tp: stats["wins"]+=1
-                elif t["be"]: stats["be"]+=1
-                else: stats["losses"]+=1
-                total=stats["wins"]+stats["losses"]
-                wr=round((stats["wins"]/total)*100,2) if total else 0
-                await context.bot.send_message(
-                    chat_id=context.job.chat_id,
-                    text=f"{sym} {'TP' if tp else 'SL'} @ {round(price,5)}\nWins {stats['wins']} Loss {stats['losses']} BE {stats['be']}\nWinRate {wr}%"
-                )
-                del active_trades[sym]
+        for sym,t in active_trades.items():
+            df=enrich(await fetch(s,sym,"15min",200))
+            if df.empty:
+                continue
+            price=df.iloc[-1]["c"]
+            if price>=t["tp"]:
+                capital += (capital*trade_percent/100)*leverage*0.1
+                learning_weight=min(1.3,learning_weight+0.03)
+                remove.append(sym)
+            elif price<=t["sl"]:
+                capital -= (capital*trade_percent/100)*leverage*0.1
+                loss_streak+=1
+                learning_weight=max(0.6,learning_weight-0.07)
+                cooldowns[sym]=now+COOLDOWN_BASE*(1+loss_streak*1.5)
+                remove.append(sym)
+    for r in remove:
+        active_trades.pop(r,None)
+        live_trades.pop(r,None)
+    if capital<=20*(1-max_loss_percent/100):
+        auto_trade_active=False
+    persist()
+
+async def live(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    if not live_trades:
+        await update.message.reply_text("No active trades currently.")
+        return
+    msg="📊 LIVE TRADES\n\n"
+    for sym,t in live_trades.items():
+        msg+=f"{sym} | {t['dir']} | Entry {t['entry']} | SL {t['sl']} | TP {t['tp']} | Score {t['score']}\n"
+    await update.message.reply_text(msg)
 
 async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
     kb=[[InlineKeyboardButton(k,callback_data=k)] for k in CRYPTOS]
-    await update.message.reply_text("📡 Click crypto to analyze or wait for top signals:",reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("📡 Select a coin or wait for auto scan",reply_markup=InlineKeyboardMarkup(kb))
     context.job_queue.run_repeating(scan,SCAN_INTERVAL,chat_id=update.effective_chat.id)
     context.job_queue.run_repeating(track,TRACK_INTERVAL,chat_id=update.effective_chat.id)
 
@@ -183,21 +183,33 @@ async def analyze_callback(update:Update,context:ContextTypes.DEFAULT_TYPE):
     await q.answer()
     sym=q.data
     async with aiohttp.ClientSession() as s:
-        sig=await multi_tf_signal(s,sym)
-        if not sig:
-            await q.edit_message_text(f"⚠️ No clear signal for {sym} right now")
+        df=enrich(await fetch(s,sym,"1h"))
+        if df.empty:
+            await q.edit_message_text("No data")
             return
-        active_trades[sym]=sig
-        news = await fetch_news(s,sym)
-        msg=f"{sym} Analysis\nDir: {sig['dir']}\nEntry: {round(sig['entry'],5)}\nSL: {round(sig['sl'],5)}\nTP: {round(sig['tp'],5)}\nScore: {sig['score']}\n"
-        if news:
-            msg+="📰 News:\n"
-            for n in news:
-                msg+=f"{n['title']}\n{n['url']}\n"
-        await q.edit_message_text(msg)
+        sig=signal(df,learning_weight)
+        if not sig:
+            await q.edit_message_text("No signal")
+            return
+        await q.edit_message_text(f"{sym}\n{sig['dir']}\nEntry {sig['entry']}\nSL {sig['sl']}\nTP {sig['tp']}\nScore {sig['score']}")
+
+async def activate(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    global auto_trade_active
+    auto_trade_active=True
+    persist()
+    await update.message.reply_text("✅ Auto-trading activated.")
+
+async def deactivate(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    global auto_trade_active
+    auto_trade_active=False
+    persist()
+    await update.message.reply_text("⏸️ Auto-trading deactivated.")
 
 if __name__=="__main__":
     app=ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("activate",activate))
+    app.add_handler(CommandHandler("deactivate",deactivate))
+    app.add_handler(CommandHandler("live",live))
     app.add_handler(CallbackQueryHandler(analyze_callback))
     app.run_polling()
