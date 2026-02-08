@@ -71,16 +71,16 @@ def sign(params):
 
 async def bybit_order(symbol,side,qty,tp,sl):
     if DRY_RUN:
-        return True,str(int(time.time()*1000))
+        return True, str(int(time.time()*1000))
     ts=int(time.time()*1000)
-    p={"api_key":BYBIT_API_KEY,"symbol":symbol,"side":side,"order_type":"Market","qty":qty,"time_in_force":"GoodTillCancel","timestamp":ts,"take_profit":tp,"stop_loss":sl}
+    p={"api_key":BYBIT_API_KEY,"symbol":symbol,"side":side,"order_type":"Market","qty":qty,"time_in_force":"PostOnly","take_profit":tp,"stop_loss":sl,"timestamp":ts}
     p["sign"]=sign(p)
-    async with HTTP.post(BYBIT_BASE+"/private/linear/order/create",data=p) as r:
-        j=await r.json()
-        return j.get("ret_code")==0,j.get("result",{}).get("order_id")
+    async with HTTP.post(f"{BYBIT_BASE}/v5/order/create", json=p) as r:
+        j = await r.json()
+        return j.get("retCode")==0, j.get("result",{}).get("orderId")
 
 async def fetch(symbol,interval,limit):
-    async with HTTP.get("https://api.twelvedata.com/time_series",params={"symbol":CRYPTOS[symbol],"interval":interval,"outputsize":limit,"apikey":TWELVEDATA_KEY}) as r:
+    async with HTTP.get("https://api.twelvedata.com/time_series", params={"symbol":CRYPTOS[symbol],"interval":interval,"outputsize":limit,"apikey":TWELVEDATA_KEY}) as r:
         j=await r.json()
         if "values" not in j:
             return pd.DataFrame()
